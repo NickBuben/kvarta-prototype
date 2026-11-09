@@ -11,16 +11,15 @@ function registerApp(app) {
   app.submittedAt = new Date().toISOString();
   addLog(app, 'Заявка подписана и зарегистрирована под номером ' + app.number, 'FR-08, FR-09');
   notifyClient(app, 'Заявка ' + app.number + ' получена. Статус можно смотреть в личном кабинете.');
-  saveState();
-  setTimeout(() => runStage(app.id, 'sanctions'), STEP_DELAY_MS);
+  next(app, 'sanctions');
 }
 
-// Один шаг обработки. Текущий шаг сохраняется в заявке, чтобы после
-// перезагрузки страницы обработка продолжилась с того же места.
+// Один шаг обработки. В заявке хранится следующий шаг, который ещё не выполнен,
+// и время его запуска. Шаг выполняется целиком и сразу записывает следующий,
+// поэтому после перезагрузки страницы ни один шаг не повторяется и не теряется.
 function runStage(appId, stage) {
   const app = findApp(appId);
-  if (!app || !['received', 'checking'].includes(app.status)) return;
-  app.stage = stage;
+  if (!app || app.stage !== stage || !['received', 'checking'].includes(app.status)) return;
   const c = company(app.clientId);
 
   if (stage === 'sanctions') {
@@ -46,9 +45,7 @@ function runStage(appId, stage) {
     if (c.bkiNoResponse) {
       app.checks.bki = 'Нет ответа';
       addLog(app, 'Запрос в БКИ отправлен, ждём ответ не дольше ' + RULES.bkiTimeoutSec + ' с', 'FR-15');
-      saveState();
-      render();
-      return setTimeout(() => runStage(app.id, 'bkiTimeout'), RULES.bkiTimeoutSec * 1000);
+      return next(app, 'bkiTimeout', RULES.bkiTimeoutSec * 1000);
     }
     app.checks.bki = bkiText(c.bki);
     addLog(app, 'Ответ БКИ получен: ' + app.checks.bki.toLowerCase(), 'FR-15');
@@ -82,10 +79,13 @@ function runStage(appId, stage) {
   }
 }
 
-function next(app, stage) {
+// Запланировать следующий шаг: сначала записать его в заявку, потом запустить таймер.
+function next(app, stage, delayMs = STEP_DELAY_MS) {
+  app.stage = stage;
+  app.stageDueAt = Date.now() + delayMs;
   saveState();
   render();
-  setTimeout(() => runStage(app.id, stage), STEP_DELAY_MS);
+  setTimeout(() => runStage(app.id, stage), delayMs);
 }
 
 // Скоринговая модель: сумма баллов по трём факторам и проверка стоп-факторов.
@@ -148,15 +148,20 @@ function setStatus(app, status) {
 
 function finish(app) {
   app.stage = null;
+  app.stageDueAt = null;
   saveState();
   render();
 }
 
-// После перезагрузки страницы продолжаем незавершённые шаги.
+// После перезагрузки страницы продолжаем незавершённые шаги с того места,
+// где остановились. Ожидание ответа БКИ не начинается заново: ждём только остаток.
 function resumeProcessing() {
   state.apps
     .filter(a => ['received', 'checking'].includes(a.status) && a.stage)
-    .forEach(a => setTimeout(() => runStage(a.id, a.stage), STEP_DELAY_MS));
+    .forEach(a => {
+      const left = a.stageDueAt ? a.stageDueAt - Date.now() : STEP_DELAY_MS;
+      setTimeout(() => runStage(a.id, a.stage), Math.max(left, 500));
+    });
 }
 
 // --- вспомогательные функции ---
